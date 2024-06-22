@@ -1,23 +1,25 @@
 from __future__ import annotations
-from loguru import logger
-from rich.syntax import Syntax
-from rich.console import Group
-from rich.box import MINIMAL
-from rich.live import Live
-from rich.panel import Panel
-from rich.markdown import Markdown
-from rich.console import Console
-from nbformat.v4 import new_code_cell, new_markdown_cell, new_output
-from nbformat import NotebookNode
-from nbclient.exceptions import CellTimeoutError, DeadKernelError
-from nbclient import NotebookClient
-import nbformat
-from typing import Literal, Tuple
-import re
-import base64
-import asyncio
 
-from ikun.core import Module
+import asyncio
+import base64
+import re
+from typing import Literal, Tuple
+
+import nbformat
+from loguru import logger
+from nbclient import NotebookClient
+from nbclient.exceptions import CellTimeoutError, DeadKernelError
+from nbformat import NotebookNode
+from nbformat.v4 import new_code_cell, new_markdown_cell, new_output
+from rich.box import MINIMAL
+from rich.console import Console
+from rich.console import Group
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+
+from ikun.core import Action
 
 
 def is_ipython() -> bool:
@@ -132,10 +134,11 @@ def parse_outputs(outputs: list[str], keep_len: int = 2000) -> Tuple[bool, str]:
     return is_success, ",".join(parsed_output)
 
 
-class ExecuteNbCode(Module):
+class ExecuteNbCode(Action):
     """execute notebook code block, return result to llm, and display it."""
 
-    def __init__(self, nb=None, timeout=600):
+    def __init__(self, nb=None, timeout=30):
+        super().__init__()
         self.nb = nb or nbformat.v4.new_notebook()
         self.nb_client = NotebookClient(self.nb, timeout=timeout)
         self.console = Console()
@@ -148,21 +151,15 @@ class ExecuteNbCode(Module):
             self.nb_client.start_new_kernel_client()
 
     async def terminate(self):
-        """kill NotebookClient"""
         if self.nb_client.km is not None and await self.nb_client.km.is_alive():
             await self.nb_client.km.shutdown_kernel(now=True)
             await self.nb_client.km.cleanup_resources()
 
             channels = [
-                # The channel for handling standard input to the kernel.
                 self.nb_client.kc.stdin_channel,
-                # The channel for heartbeat communication between the kernel and client.
                 self.nb_client.kc.hb_channel,
-                # The channel for controlling the kernel.
                 self.nb_client.kc.control_channel,
             ]
-
-            # Stops all the running channels for this kernel
             for channel in channels:
                 if channel.is_alive():
                     channel.stop()
@@ -184,14 +181,12 @@ class ExecuteNbCode(Module):
 
     def _display(self, code: str, language="python"):
         if language == "python":
-            code = Syntax(code, "python", theme="paraiso-dark",
-                          line_numbers=True)
+            code = Syntax(code, "python", theme="paraiso-dark", line_numbers=True)
             self.console.print(code)
         elif language == "markdown":
             display_markdown(code)
         else:
-            raise ValueError(
-                f"Only support for python, markdown, but got {language}")
+            raise ValueError(f"Only support for python, markdown, but got {language}")
 
     async def run_cell(self, cell: NotebookNode, cell_index: int) -> Tuple[bool, str]:
 
@@ -210,33 +205,21 @@ class ExecuteNbCode(Module):
         except Exception:
             return parse_outputs(self.nb.cells[-1].outputs)
 
-    async def arun(self, **kwargs) -> Tuple[str, bool]:
-        self._display(x, language)
-
-        if language == "python":
-            # add code to the notebook
-            self.add_code_cell(code=x)
-
-            # build code executor
-            await self.build()
-
-            # run code
-            cell_index = len(self.nb.cells) - 1
-            success, outputs = await self.run_cell(self.nb.cells[-1], cell_index)
-
-            if "!pip" in x:
-                success = False
-
-            return outputs, success
-
-        elif language == "markdown":
-            # add markdown content to markdown cell in a notebook.
-            self.add_markdown_cell(x)
-            # return True, beacuse there is no execution failure for markdown cell.
-            return x, True
-        else:
-            raise ValueError(
-                f"Only support for language: python, markdown, but got {language}, ")
-
-    def run(self, x):
-        return asyncio.run(self.arun())
+    async def forward(self, x):
+        for i in x:
+            code = i["content"]
+            language = i["type"]
+            self._display(x, language)
+            if language == "python":
+                self.add_code_cell(code=code)
+                await self.build()
+                cell_index = len(self.nb.cells) - 1
+                success, outputs = await self.run_cell(self.nb.cells[-1], cell_index)
+                if "!pip" in code:
+                    success = False
+                x["execution_result"] = outputs
+                x["is_success"] = success
+            elif language == "markdown":
+                self.add_markdown_cell(code)
+                pass
+        return x
